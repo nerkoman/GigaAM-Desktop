@@ -1440,7 +1440,11 @@ pub mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
+#[path = "live_linux.rs"]
+pub mod platform;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub mod platform {
     use super::*;
     use std::sync::{Arc, Mutex};

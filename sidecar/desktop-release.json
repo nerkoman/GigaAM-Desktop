@@ -1,0 +1,25 @@
+{
+  "build": "20261124-3",
+  "shared": {
+    "url": "https://github.com/nerkoman/GigaAM-Desktop/releases/download/b20261124-3/GigaAM-Desktop-b20261124-3-runtime-data.zip",
+    "sha256": "f1ab4d4451e891b4fce5e204c2f326333e1346e045350495be1f4e4de81b9b0d"
+  },
+  "platforms": {
+    "windows": {
+      "python_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.12.13%2B20260414-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "python_sha256": "d785d2e901a8194dcdb8c23c2b37a46ed84fdc04e87398dc5b832644330de71e",
+      "cpu_wheels": [
+        "https://download-r2.pytorch.org/whl/cpu/torch-2.10.0%2Bcpu-cp312-cp312-win_amd64.whl#sha256=21cb5436978ef47c823b7a813ff0f8c2892e266cfe0f1d944879b5fba81bf4e1",
+        "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.10.0%2Bcpu-cp312-cp312-win_amd64.whl#sha256=32707736ef079a673433ca36c227c135375602b74d41ee21ff18d1e75caee0b0"
+      ]
+    },
+    "linux": {
+      "python_url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.12.13%2B20260414-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "python_sha256": "3c3427e5628648478da2aa227472c350475a68bc58109f1b43849636a4aecb89",
+      "cpu_wheels": [
+        "https://download-r2.pytorch.org/whl/cpu/torch-2.10.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=ee40b8a4b4b2cf0670c6fd4f35a7ef23871af956fecb238fbf5da15a72650b1d",
+        "https://download-r2.pytorch.org/whl/cpu/torchaudio-2.10.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=502b19a5bd0ef8fc97adf06c24146c5e2b94bc3c43b768174407c031cd21c3a5"
+      ]
+    }
+  }
+}

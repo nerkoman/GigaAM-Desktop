@@ -7,6 +7,8 @@ node_modules
 
 # Scratch inputs (local test audio, task notes)
 /project-input/
+/src-tauri/offline/meeting-runtime/*
+!/src-tauri/offline/meeting-runtime/README.txt
 
 # Marketing website is maintained separately; tracked legacy files remain tracked.
 /site/

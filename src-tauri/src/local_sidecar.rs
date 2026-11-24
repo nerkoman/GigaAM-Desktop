@@ -74,9 +74,9 @@ pub fn process_recording(
     let python = configured_path(
         "LOCAL_MEETINGS_PYTHON",
         if packaged {
-            root.join("python/bin/python3.12")
+            root.join(if cfg!(windows) { "python/python.exe" } else { "python/bin/python3.12" })
         } else {
-            root.join("project-input/dia-venv/bin/python")
+            root.join(if cfg!(windows) { "project-input/dia-venv/Scripts/python.exe" } else { "project-input/dia-venv/bin/python" })
         },
     );
     let asr_model = configured_path("LOCAL_MEETINGS_ASR_MODEL", root.join("models/runtime"));
@@ -135,9 +135,17 @@ pub fn process_recording(
         let mut command = Command::new(&python);
         command.current_dir(&root).arg("-B");
         if packaged {
-            command.env("FFMPEG_BINARY", root.join("bin/ffmpeg"))
-                .env("DYLD_FALLBACK_LIBRARY_PATH", root.join("lib"))
-                .env("PYTHONNOUSERSITE", "1").env_remove("PYTHONPATH").env_remove("PYTHONHOME");
+            command.env("PYTHONNOUSERSITE", "1").env_remove("PYTHONPATH").env_remove("PYTHONHOME");
+            let bin = root.join("bin");
+            let ffmpeg = bin.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+            if ffmpeg.is_file() { command.env("FFMPEG_BINARY", ffmpeg); }
+            #[cfg(target_os = "macos")]
+            command.env("DYLD_FALLBACK_LIBRARY_PATH", root.join("lib"));
+            #[cfg(windows)]
+            if let Ok(path) = std::env::join_paths(std::iter::once(bin)
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))) {
+                command.env("PATH", path);
+            }
         }
         command
     };

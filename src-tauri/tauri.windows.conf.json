@@ -1,0 +1,4 @@
+{
+  "build": { "beforeBuildCommand": "node scripts/build-offline-desktop.mjs" },
+  "bundle": { "resources": { "offline/meeting-runtime/": "meeting-runtime/" } }
+}

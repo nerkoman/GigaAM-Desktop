@@ -19,7 +19,7 @@ const buildNumber = process.env.GITHUB_RUN_NUMBER ?? process.env.BUILD_NUMBER ??
 export default defineConfig({
 	define: {
 		__APP_VERSION__: JSON.stringify(packageVersion),
-		__BUILD_ID__: JSON.stringify(`${buildDate}-${buildNumber}`)
+		__BUILD_ID__: JSON.stringify(process.env.GIGAAM_BUILD_ID ?? `${buildDate}-${buildNumber}`)
 	},
 	plugins: [
 		svelteTesting(),

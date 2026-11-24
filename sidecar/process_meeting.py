@@ -47,7 +47,7 @@ def decode_audio(path: Path) -> np.ndarray:
 def read_tracks(session: Path) -> list[dict]:
     tracks_path = session / "tracks.json"
     if tracks_path.exists():
-        tracks = json.loads(tracks_path.read_text())
+        tracks = json.loads(tracks_path.read_text(encoding="utf-8"))
         return [
             {
                 "kind": "microphone" if Path(item["file"]).stem.split("-", 1)[0] == "microphone" else "system",
@@ -152,17 +152,17 @@ def main() -> None:
     if not utterances:
         raise ValueError("На дорожках не найдено распознанной речи")
     args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / "transcript.md").write_text(transcript + "\n")
+    (args.output / "transcript.md").write_text(transcript + "\n", encoding="utf-8")
     (args.output / "segments.json").write_text(json.dumps(
         [asdict(item) for item in utterances], ensure_ascii=False, indent=2
-    ) + "\n")
+    ) + "\n", encoding="utf-8")
     warning = None
     if not args.skip_protocol:
         try:
             protocol = generate_protocol(transcript, args.ollama_model, args.ollama_endpoint)
             if not protocol:
                 raise ValueError("Ollama вернула пустой протокол")
-            (args.output / "protocol.md").write_text(protocol + "\n")
+            (args.output / "protocol.md").write_text(protocol + "\n", encoding="utf-8")
         except (OSError, http.client.HTTPException, KeyError, ValueError) as error:
             warning = f"Диаризация готова. Не удалось подготовить протокол: {error}"
     if args.json_result:
