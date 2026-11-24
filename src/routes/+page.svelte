@@ -42,6 +42,7 @@
 	let segments = $state<Segment[]>([]);
 	let sentenceView = $state(true);
 	let diarizationBusy = $state(false);
+	let protocolInProgress = $state('');
 	let diarizationModel = $state('');
 	let updateAvailable = $state(false);
 	let pendingDiarization = $state('');
@@ -698,9 +699,9 @@
 			selectedId = command === 'delete_history' ? '' : selectedId;
 			if (command === 'retry_transcription') segments = [];
 			await refresh();
-		} catch {
+		} catch (cause) {
 			if (pendingDiarization === id) pendingDiarization = '';
-			error = locale === 'ru' ? 'Не удалось выполнить действие.' : 'Could not perform the action.';
+			error = String(cause);
 			busy = false;
 			recognitionStage = '';
 		}
@@ -807,7 +808,13 @@
 
 	function copyTranscript() {
 		const dual = segments.some((segment) => segment.source_track === 'microphone') && segments.some((segment) => segment.source_track === 'system');
-		copyTranscriptText(segments.map((segment) => `[${time(segment.start_seconds)}] ${dual ? `${segment.source_track === 'microphone' ? (locale === 'ru' ? 'Микрофон' : 'Microphone') : (locale === 'ru' ? 'Система' : 'System')}: ` : ''}${segment.text}`).join('\n'));
+		const lines = segments.map((segment) => {
+			const track = dual ? trackLabel(segment) : '';
+			const speaker = segment.speaker_id;
+			const author = speaker && track ? `${speaker} (${track})` : speaker || track;
+			return `[${time(segment.start_seconds)}] ${author ? `${author}: ` : ''}${segment.text}`;
+		});
+		void copyTranscriptText(lines.join('\n'));
 	}
 
 	async function copyTranscriptText(text: string) {
@@ -830,6 +837,28 @@
 		} catch (cause) { error = String(cause); }
 		finally { diarizationBusy = false; }
 	}
+	async function processLocalMeeting() {
+		if (!selected || browserMode || diarizationBusy) return;
+		const id = selected.id;
+		let unlisten: (() => void) | undefined;
+		try {
+			diarizationBusy = true;
+			unlisten = await listen<string>('local-meeting-protocol', ({ payload }) => {
+				if (payload === id) { protocolInProgress = id; void refresh(); }
+			}).catch(() => undefined);
+			const protocolWarning = await invoke<string | null>('process_local_meeting', { id, speakerCount: null, ollamaModel: ollamaModel || null });
+			const updated = await invoke<Segment[]>('get_segments', { id });
+			const protocol = await invoke<string>('load_summary', { id });
+			if (selected?.id === id) {
+				segments = updated; summaryText = protocol; summaryFor = id;
+				if (!protocolWarning && protocol.trim()) { summaryTab = 'summary'; summaryMode = true; }
+			}
+			if (protocolWarning) error = protocolWarning;
+			else notify(locale === 'ru' ? 'Диаризация и протокол готовы.' : 'Diarization and protocol are ready.');
+		} catch (cause) { error = String(cause); }
+		finally { unlisten?.(); protocolInProgress = ''; diarizationBusy = false; }
+	}
+
 	async function transcribeWithDiarization() {
 		if (!selected || browserMode || diarizationBusy) return;
 		diarizationDialog = true;
@@ -849,7 +878,8 @@
 		await action(selected.status === 'queued' ? 'start_transcription' : 'retry_transcription', id);
 	}
 	function speakerKey(segment: Segment) { return `${segment.source_track}:${segment.speaker_id ?? ''}`; }
-	function speakerLabel(segment: Segment) { return segment.speaker_id || (segment.source_track === 'microphone' ? (locale === 'ru' ? 'Микрофон' : 'Microphone') : segment.source_track === 'system' ? (locale === 'ru' ? 'Система' : 'System') : ''); }
+	function trackLabel(segment: Segment) { return segment.source_track === 'microphone' ? (locale === 'ru' ? 'Микрофон' : 'Microphone') : segment.source_track === 'system' ? (locale === 'ru' ? 'Система' : 'System') : ''; }
+	function speakerLabel(segment: Segment) { return segment.speaker_id || trackLabel(segment); }
 	async function saveSpeaker(segment: Segment) {
 		if (!selected) return;
 		const id = selected.id, old = segment.speaker_id ?? null, track = segment.source_track, name = speakerDraft.trim();
@@ -1239,7 +1269,7 @@
 				{/if}
 				<div hidden={summaryMode}>
 				{#if recognitionStage || ['preparing', 'transcribing'].includes(selected.status)}<div class="recognition-status" role="status">{#if selected.total_chunks && selected.total_chunks > 0}<progress aria-label={locale === 'ru' ? 'Распознавание' : 'Recognition'} value={selected.completed_chunks} max={selected.total_chunks}></progress>{:else}<progress aria-label={locale === 'ru' ? 'Распознавание' : 'Recognition'}></progress>{/if}<span>{recognitionStage || statuses[locale][selected.status]}{#if selected.total_chunks} · {selected.completed_chunks} / {selected.total_chunks}{/if}</span></div>{/if}
-				{#if diarizationBusy}<div class="recognition-status" role="status"><progress aria-label={locale === 'ru' ? 'Диаризация' : 'Diarization'}></progress><span>{locale === 'ru' ? 'Определение говорящих…' : 'Identifying speakers…'}</span></div>{/if}
+				{#if diarizationBusy}<div class="recognition-status" role="status"><progress aria-label={locale === 'ru' ? 'Обработка встречи' : 'Meeting processing'}></progress><span>{protocolInProgress === selected.id ? (locale === 'ru' ? 'Говорящие определены. Составляется протокол…' : 'Speakers identified. Preparing minutes…') : (locale === 'ru' ? 'Определение говорящих…' : 'Identifying speakers…')}</span></div>{/if}
 				{#if browserMode && browserTracks.length > 1}<label>{locale === 'ru' ? 'Аудиодорожка' : 'Audio track'}<Dropdown variant="select" label={locale === 'ru' ? 'Дорожка' : 'Track'} value={browserTrackChoice} items={[{value:'mix',label:locale === 'ru' ? 'Все дорожки вместе' : 'All tracks mixed'}, ...[...browserTracks].sort((a,b) => Number(b.track === 'system') - Number(a.track === 'system')).map((track) => ({value:track.path,label:track.track === 'system' ? (locale === 'ru' ? 'Система' : 'System') : (locale === 'ru' ? 'Микрофон' : 'Microphone')}))]} onchange={(value) => void chooseBrowserTrack(value)} /></label>{/if}
 				{#if browserMode}<button onclick={() => void resumeRemoteUpload(selected.id)}>{locale === 'ru' ? 'Повторить отправку из архива' : 'Resume archive upload'}</button>{/if}
 				{#if browserMode && mixedSrc}<button class="ghost" onclick={() => void downloadCompactAudio()}>Скачать аудио · Opus</button>{/if}
@@ -1257,7 +1287,7 @@
 				{/if}
 				{#if !segments.length}{#if selected.status === 'completed'}<div class="empty-transcript"><p>{locale === 'ru' ? 'В записи не найдена речь: сегментов нет. Если аудио не пустое, нажмите «Повторить» для перезапуска распознавания.' : 'No speech found in this recording. If the audio is not empty, press Retry to re-run recognition.'}</p></div>{:else}<div class="processing"><span></span><p>{statuses[locale][selected.status]}</p></div>{/if}{/if}
 			</div></section>
-			<footer><div class="export">{#if !browserMode}<button class="mode-switch" class:active={summaryMode} role="switch" aria-checked={summaryMode} onclick={() => summaryMode = !summaryMode}><span>{locale === 'ru' ? 'Распознавание' : 'Transcription'}</span><i aria-hidden="true"></i><span>{locale === 'ru' ? 'Саммари' : 'Summary'}</span></button>{/if}<div class="tools">{#if summaryMode}<button class="primary" disabled={summaryBusy || !segments.length || recording} onclick={() => void summarizeLocal()}>{locale === 'ru' ? 'Суммаризовать' : 'Summarize'}</button>{:else if ['queued', 'failed', 'cancelled', 'interrupted', 'completed'].includes(selected.status)}{#if browserMode}<button class="primary" onclick={() => void action(selected.status === 'queued' ? 'start_transcription' : 'retry_transcription', selected.id)}>{t.start}</button>{:else}<Dropdown variant="primary" label={t.start}>{#snippet trigger()}{t.start} <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>{/snippet}<button onclick={() => void action(selected.status === 'queued' ? 'start_transcription' : 'retry_transcription', selected.id)}>{t.start}</button><button onclick={() => void transcribeWithDiarization()}>{locale === 'ru' ? 'Распознать с диаризацией' : 'Transcribe with diarization'}</button></Dropdown>{/if}{/if}</div><Dropdown label={t.export}>{#snippet trigger()}{t.export} <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>{/snippet}<button onclick={() => void exportResult()}>{locale === 'ru' ? 'В файл' : 'To file'}</button><button onclick={() => summaryMode ? void copyTranscriptText(summaryText) : void copyTranscript()}>{t.copy}</button></Dropdown></div><div class="danger">{#if summaryMode && summaryBusy && summaryTaskId === selected.id}<button disabled={summaryStopping} onclick={() => void stopSummary()}>{locale === 'ru' ? 'Стоп' : 'Stop'}</button>{:else if !summaryMode && ['preparing', 'transcribing'].includes(selected.status)}<button onclick={() => void action('cancel_transcription', selected.id)}>{locale === 'ru' ? 'Стоп' : 'Stop'}</button>{:else if summaryMode}<button disabled={summarySaving || !summaryText} onclick={() => { summaryText = ''; summaryEditing = false; void persistSummary(selected.id, ''); }}>{locale === 'ru' ? 'Очистить' : 'Clear'}</button>{:else if !['queued', 'preparing', 'transcribing'].includes(selected.status)}<button disabled={recording || busy || !segments.length} onclick={() => confirmClear = true}>{locale === 'ru' ? 'Очистить' : 'Clear'}</button>{/if}</div></footer>
+			<footer><div class="export">{#if !browserMode}<button class="mode-switch" class:active={summaryMode} role="switch" aria-checked={summaryMode} onclick={() => summaryMode = !summaryMode}><span>{locale === 'ru' ? 'Распознавание' : 'Transcription'}</span><i aria-hidden="true"></i><span>{locale === 'ru' ? 'Саммари' : 'Summary'}</span></button>{/if}<div class="tools">{#if summaryMode}<button class="primary" disabled={summaryBusy || !segments.length || recording} onclick={() => void summarizeLocal()}>{locale === 'ru' ? 'Суммаризовать' : 'Summarize'}</button>{:else if ['queued', 'failed', 'cancelled', 'interrupted', 'completed'].includes(selected.status)}{#if browserMode}<button class="primary" onclick={() => void action(selected.status === 'queued' ? 'start_transcription' : 'retry_transcription', selected.id)}>{t.start}</button>{:else}<Dropdown variant="primary" label={t.start}>{#snippet trigger()}{t.start} <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>{/snippet}<button onclick={() => void action(selected.status === 'queued' ? 'start_transcription' : 'retry_transcription', selected.id)}>{t.start}</button><button onclick={() => void transcribeWithDiarization()}>{locale === 'ru' ? 'Распознать с диаризацией' : 'Transcribe with diarization'}</button><button disabled={diarizationBusy} onclick={() => void processLocalMeeting()}>{locale === 'ru' ? 'Диаризация + протокол' : 'Diarization + protocol'}</button></Dropdown>{/if}{/if}</div><Dropdown label={t.export}>{#snippet trigger()}{t.export} <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 15 6-6 6 6"/></svg>{/snippet}<button onclick={() => void exportResult()}>{locale === 'ru' ? 'В файл' : 'To file'}</button><button onclick={() => summaryMode ? void copyTranscriptText(summaryText) : void copyTranscript()}>{t.copy}</button></Dropdown></div><div class="danger">{#if summaryMode && summaryBusy && summaryTaskId === selected.id}<button disabled={summaryStopping} onclick={() => void stopSummary()}>{locale === 'ru' ? 'Стоп' : 'Stop'}</button>{:else if !summaryMode && ['preparing', 'transcribing'].includes(selected.status)}<button disabled={finalizing || (selected.kind === 'live' && !browserMode && (busy || !recording))} onclick={() => selected.kind === 'live' && !browserMode ? void stopRecording() : void action('cancel_transcription', selected.id)}>{locale === 'ru' ? 'Стоп' : 'Stop'}</button>{:else if summaryMode}<button disabled={summarySaving || !summaryText} onclick={() => { summaryText = ''; summaryEditing = false; void persistSummary(selected.id, ''); }}>{locale === 'ru' ? 'Очистить' : 'Clear'}</button>{:else if !['queued', 'preparing', 'transcribing'].includes(selected.status)}<button disabled={recording || busy || !segments.length} onclick={() => confirmClear = true}>{locale === 'ru' ? 'Очистить' : 'Clear'}</button>{/if}</div></footer>
 		{:else}
 			<div class="welcome"><div class="wave">∿</div><h1>{t.waiting}</h1><p>{t.empty}</p><button class="add-large" disabled={!model.installed && !browserMode} onclick={pickFiles}>＋ {t.add}</button></div>
 		{/if}

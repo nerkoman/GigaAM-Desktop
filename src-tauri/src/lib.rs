@@ -5,6 +5,7 @@ pub mod google_drive;
 pub mod drive_outbox;
 pub mod finalization;
 pub mod live;
+pub mod local_sidecar;
 pub mod model_manager;
 pub mod pipeline;
 pub mod queue;
@@ -30,7 +31,7 @@ use domain::{
     suppress_microphone_echo,
 };
 use export::ExportFormat;
-use live::{ArchiveFormat, LiveCapture, LiveSource, LiveStatus, clamp_gain};
+use live::{ArchiveFormat, LiveCapture, LiveSource, LiveStatus, TrackOffset, clamp_gain};
 use model_manager::{ModelManager, ModelStatus};
 use pipeline::{LiveScanner, NativeFileProcessor};
 use queue::process_next;
@@ -168,7 +169,7 @@ async fn google_drive_prepare_folder() -> Result<String,String> {
 async fn google_drive_upload(id: String, app: tauri::AppHandle, state: tauri::State<'_, Arc<Mutex<Store>>>) -> Result<(),String> {
     // Prepare the same timeline-aligned mix used by Desktop playback.
     if lock_store(&state)?.get(&id).map_err(|e|e.to_string())?.is_some_and(|record|matches!(record.kind,TranscriptionKind::Live)) {
-        mixed_session_audio(id.clone(),app.clone())?;
+        mixed_session_audio(id.clone(),app.clone()).await?;
     }
     queue_drive_snapshot(id,None,app,state).await
 }
@@ -488,7 +489,10 @@ fn enqueue_files(
 #[tauri::command]
 async fn installed_diarization_model(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let path = app.path().app_data_dir().map_err(|_| "App data unavailable")?.join("diarization").join("wespeaker-resnet34.onnx");
-    tauri::async_runtime::spawn_blocking(move || if diarization::verify_speaker_model(&path).is_ok() { Some(path.to_string_lossy().into_owned()) } else { None })
+    let bundled = local_sidecar::bundled_runtime(&app).map(|root| root.join("models/wespeaker-resnet34.onnx"));
+    tauri::async_runtime::spawn_blocking(move || std::iter::once(path).chain(bundled)
+        .find(|path| diarization::verify_speaker_model(path).is_ok())
+        .map(|path| path.to_string_lossy().into_owned()))
         .await.map_err(|_| "Model check failed".to_owned())
 }
 
@@ -500,7 +504,7 @@ async fn download_diarization_model(app: tauri::AppHandle) -> Result<String, Str
 }
 
 #[tauri::command]
-async fn diarize_recording(id: String, model_path: String, speaker_count: Option<usize>, state: tauri::State<'_, Arc<Mutex<Store>>>) -> Result<(), String> {
+async fn diarize_recording(id: String, model_path: String, speaker_count: Option<usize>, app: tauri::AppHandle, state: tauri::State<'_, Arc<Mutex<Store>>>) -> Result<(), String> {
     let store = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         diarization::verify_speaker_model(Path::new(&model_path)).map_err(|_| "Модель говорящих не прошла проверку; загрузите поддерживаемую модель".to_owned())?;
@@ -511,14 +515,34 @@ async fn diarize_recording(id: String, model_path: String, speaker_count: Option
             let segments = db.segments(&id).map_err(|_| "transcript unavailable")?;
             (record, segments)
         };
-        let path = record.audio_path.as_deref().unwrap_or(&record.source_path);
-        let speakers = diarization::analyze_file_with_count(Path::new(path), Path::new(&model_path), &segments, speaker_count).map_err(|error| format!("Диаризация не выполнена: {error}"))?;
+        let mut path = PathBuf::from(record.audio_path.as_deref().unwrap_or(&record.source_path));
+        if record.kind == TranscriptionKind::Live {
+            let directory = prepare_stopped_live_archive(&app, &store, &record)?;
+            if directory.is_dir() && (path.starts_with(&directory) || directory.join("tracks.json").is_file()) {
+                path = PathBuf::from(prepare_mixed_session_audio(&id, &app)?);
+            }
+        }
+        let speakers = diarization::analyze_file_with_count(&path, Path::new(&model_path), &segments, speaker_count).map_err(|error| format!("Диаризация не выполнена: {error}"))?;
         let mut db = store.lock().map_err(|_| "database unavailable")?;
         if !db.set_speakers_if_unchanged(&segments, &speakers).map_err(|_| "could not save speaker labels")? {
             return Err("Транскрипт изменился во время обработки; повторите попытку".to_owned());
         }
         Ok(())
     }).await.map_err(|_| "diarization worker failed".to_owned())?
+}
+
+#[tauri::command]
+async fn process_local_meeting(
+    app: tauri::AppHandle,
+    id: String,
+    speaker_count: Option<usize>,
+    ollama_model: Option<String>,
+    state: tauri::State<'_, Arc<Mutex<Store>>>,
+) -> Result<Option<String>, String> {
+    let store = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        local_sidecar::process_recording(&app, store, id, speaker_count, ollama_model)
+    }).await.map_err(|_| "local meeting worker failed".to_owned())?
 }
 
 #[tauri::command]
@@ -672,28 +696,30 @@ async fn cancel_transcription(
 }
 
 #[tauri::command]
-fn retry_transcription(
-    id: String,
-    state: tauri::State<'_, Arc<Mutex<Store>>>,
-    worker: tauri::State<'_, WorkerHandle>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+async fn retry_transcription(id: String, app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || retry_from_archive(&id, &app))
+        .await.map_err(|_| "Ошибка подготовки аудио".to_owned())?
+}
+
+fn retry_from_archive(id: &str, app: &tauri::AppHandle) -> Result<(), String> {
     // A live session re-transcribes from its MIXED archive audio (both
     // tracks); reset_for_retry then turns the row into a regular file job.
-    let live = lock_store(&state)?
-        .get(&id)
+    let state = app.state::<Arc<Mutex<Store>>>();
+    let record = lock_store(&state)?
+        .get(id)
         .map_err(|error| error.to_string())?
-        .is_some_and(|record| record.kind == TranscriptionKind::Live);
-    if live {
-        let mixed = mixed_session_audio(id.clone(), app)?;
+        .ok_or("Запись не найдена")?;
+    if record.kind == TranscriptionKind::Live {
+        prepare_stopped_live_archive(app, &state, &record)?;
+        let mixed = prepare_mixed_session_audio(id, app)?;
         lock_store(&state)?
-            .set_audio_path(&id, Some(&mixed))
+            .set_audio_path(id, Some(&mixed))
             .map_err(|error| error.to_string())?;
     }
     lock_store(&state)?
-        .reset_for_retry(&id)
+        .reset_for_retry(id)
         .map_err(|error| error.to_string())?;
-    worker.0.send(()).map_err(|error| error.to_string())
+    app.state::<WorkerHandle>().0.send(()).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -858,24 +884,52 @@ fn rename_transcription(
         .map_err(|error| error.to_string())
 }
 
-#[derive(serde::Deserialize)]
-struct TrackOffset {
-    file: String,
-    #[serde(default)]
-    offset_seconds: f64,
+fn prepare_stopped_live_archive(
+    app: &tauri::AppHandle,
+    store: &Mutex<Store>,
+    record: &Transcription,
+) -> Result<PathBuf, String> {
+    if record.id.is_empty() || record.id.contains(['/', '\\']) || record.id.contains("..") {
+        return Err("Некорректный идентификатор записи".into());
+    }
+    if matches!(record.status, TranscriptionStatus::Preparing | TranscriptionStatus::Transcribing | TranscriptionStatus::Queued) {
+        return Err("Дождитесь завершения записи и сохранения дорожек".into());
+    }
+    let live = app.state::<LiveState>();
+    if live.finalization_cancel.lock().map_err(|_| "Состояние записи недоступно")?
+        .as_ref().is_some_and(|(id, _)| id == &record.id)
+    {
+        return Err("Идёт сохранение дорожек записи".into());
+    }
+    let directory = app.path().app_data_dir().map_err(|error| error.to_string())?.join("live").join(&record.id);
+    if let Some((first, duration)) = live::recover_retained_tracks(&directory, record.started_ms.unwrap_or(record.created_ms))
+        .map_err(|error| format!("Не удалось восстановить дорожки: {error}"))? {
+        store.lock().map_err(|_| "База данных недоступна")?
+            .record_recovered_archive(&record.id, &first.to_string_lossy(), duration, now_ms())
+            .map_err(|error| format!("Не удалось сохранить сведения о дорожках: {error}"))?;
+    }
+    Ok(directory)
 }
 
 #[tauri::command]
-fn mixed_session_audio(id: String, app: tauri::AppHandle) -> Result<String, String> {
+async fn mixed_session_audio(id: String, app: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || prepare_mixed_session_audio(&id, &app))
+        .await.map_err(|_| "Ошибка подготовки общего звука".to_owned())?
+}
+
+fn prepare_mixed_session_audio(id: &str, app: &tauri::AppHandle) -> Result<String, String> {
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
         return Err("invalid transcription ID".into());
     }
+    // Playback and diarization can request the same staged mix simultaneously.
+    static MIXING: Mutex<()> = Mutex::new(());
+    let _guard = MIXING.lock().map_err(|_| "Подготовка общего звука прервана")?;
     let directory = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?
         .join("live")
-        .join(&id);
+        .join(id);
     let mut inputs: Vec<PathBuf> = std::fs::read_dir(&directory)
         .map_err(|error| error.to_string())?
         .flatten()
@@ -923,7 +977,7 @@ fn mixed_session_audio(id: String, app: tauri::AppHandle) -> Result<String, Stri
         })
         .collect();
     let output = directory.join(format!("mixed.{extension}"));
-    let log_path = debug_log_path(&app);
+    let log_path = debug_log_path(app);
     let log = |message: &str| {
         if let Some(path) = log_path.as_ref() {
             debug_log(path, message);
@@ -932,6 +986,7 @@ fn mixed_session_audio(id: String, app: tauri::AppHandle) -> Result<String, Stri
     let newest_input = tracks
         .iter()
         .filter_map(|(path, _)| std::fs::metadata(path).ok()?.modified().ok())
+        .chain(std::fs::metadata(directory.join("tracks.json")).and_then(|meta| meta.modified()).ok())
         .max();
     let output_fresh = std::fs::metadata(&output)
         .ok()
@@ -1105,11 +1160,7 @@ fn start_live(
         debug_log(path, "capture threads spawned");
     }
     let store = state.inner().clone();
-    let model_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("models");
+    let model_dir = app.state::<ModelManager>().directory();
     let (stop_tx, stop_rx) = mpsc::channel();
     let live_id = transcription.id.clone();
     let live_error = live.error.clone();
@@ -1659,12 +1710,14 @@ pub fn run() {
             let mut store = Store::open(data_dir.join("gigaam.sqlite3"))?;
             store.recover_interrupted(now_ms())?;
             let store = Arc::new(Mutex::new(store));
-            let model_dir = data_dir.join("models");
-            let worker = start_worker(store.clone(), model_dir.clone());
+            let bundled_models = local_sidecar::bundled_runtime(app.handle())
+                .map(|root| root.join("models/runtime"));
+            let models = ModelManager::with_bundle(data_dir.join("models"), bundled_models);
+            let worker = start_worker(store.clone(), models.directory());
             worker.0.send(()).map_err(std::io::Error::other)?;
             app.manage(store);
             app.manage(worker);
-            app.manage(ModelManager::new(model_dir));
+            app.manage(models);
             app.manage(LiveState::new());
             if let Some(path) = app
                 .path()
@@ -1713,6 +1766,7 @@ pub fn run() {
             set_phrase_recognition,
             get_phrase_recognition,
             diarize_recording,
+            process_local_meeting,
             download_diarization_model,
             installed_diarization_model,
             list_queue,

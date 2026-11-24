@@ -183,6 +183,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn record_recovered_archive(&mut self, id: &str, path: &str, duration: f64, now_ms: i64) -> rusqlite::Result<()> {
+        let tx = self.connection.transaction()?;
+        let changed = tx.execute(
+            "UPDATE transcriptions SET audio_path=COALESCE(NULLIF(audio_path,''),?2),
+             duration_seconds=COALESCE(duration_seconds,?3)
+             WHERE id=?1 AND kind='live' AND status IN ('completed','cancelled','failed','interrupted')",
+            params![id, path, duration],
+        )?;
+        if changed != 1 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+        tx.execute("UPDATE live_finalizations SET state='completed',updated_ms=?2
+                    WHERE transcription_id=?1 AND state!='completed'", params![id, now_ms])?;
+        tx.commit()
+    }
+
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let connection = Connection::open(path)?;
         let mut store = Self { connection };
@@ -791,6 +805,39 @@ impl Store {
             "UPDATE transcriptions SET completed_chunks = MAX(completed_chunks, ?2)
              WHERE id = ?1",
             params![segment.transcription_id, segment.index + 1],
+        )?;
+        transaction.commit()
+    }
+
+    pub fn replace_segments(&mut self, transcription_id: &str, segments: &[TranscriptSegment]) -> rusqlite::Result<()> {
+        if segments.is_empty() || segments.iter().any(|segment| segment.transcription_id != transcription_id) {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM transcript_segments WHERE transcription_id = ?1", [transcription_id])?;
+        for segment in segments {
+            transaction.execute(
+                "INSERT INTO transcript_segments (
+                   id, transcription_id, segment_index, start_seconds, end_seconds, text,
+                   source_track, speaker_id, state
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    segment.id,
+                    segment.transcription_id,
+                    segment.index,
+                    segment.start_seconds,
+                    segment.end_seconds,
+                    segment.text,
+                    source_track_value(segment.source_track),
+                    segment.speaker_id,
+                    segment_state_value(segment.state),
+                ],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE transcriptions SET status='completed', completed_chunks=?2, total_chunks=?2,
+             completed_ms=?3, error=NULL, cancel_requested=0, start_requested=0 WHERE id=?1",
+            params![transcription_id, segments.len(), crate::now_ms()],
         )?;
         transaction.commit()
     }
@@ -1529,6 +1576,45 @@ mod tests {
         assert!(store.list_queue().unwrap().is_empty());
         assert_eq!(store.list_history().unwrap().len(), 1);
         assert_eq!(store.segments("tx").unwrap(), [segment]);
+    }
+
+    #[test]
+    fn replacing_segments_swaps_text_track_and_speaker_atomically() {
+        let mut store = Store::memory().unwrap();
+        store.enqueue(&transcription("tx", TranscriptionStatus::Completed)).unwrap();
+        let original = TranscriptSegment::new("tx", 0, 0.0, 1.0, "old".into(), SourceTrack::File, SegmentState::Final).unwrap();
+        store.append_segment(&original).unwrap();
+        let mut replacement = TranscriptSegment::new("tx", 0, 0.5, 1.5, "new".into(), SourceTrack::System, SegmentState::Final).unwrap();
+        replacement.speaker_id = Some("Участник 1".into());
+        store.replace_segments("tx", &[replacement.clone()]).unwrap();
+        assert_eq!(store.segments("tx").unwrap(), [replacement]);
+        let record = store.get("tx").unwrap().unwrap();
+        assert_eq!(record.completed_chunks, 1);
+        assert_eq!(record.total_chunks, Some(1));
+    }
+
+    #[test]
+    fn recovering_a_cancelled_archive_keeps_its_text_until_diarization_commits() {
+        let mut store = Store::memory().unwrap();
+        let mut record = transcription("live", TranscriptionStatus::Cancelled);
+        record.kind = crate::domain::TranscriptionKind::Live;
+        store.enqueue(&record).unwrap();
+        store.begin_live_finalization("live", 1).unwrap();
+        store.finish_live_finalization("live", false, 2).unwrap();
+        let mut segment = TranscriptSegment::new("live", 0, 0.0, 1.0, "speech".into(), SourceTrack::System, SegmentState::Final).unwrap();
+        store.append_segment(&segment).unwrap();
+        store.record_recovered_archive("live", "system.ogg", 10.0, 3).unwrap();
+        assert_eq!(store.get("live").unwrap().unwrap().status, TranscriptionStatus::Cancelled);
+        assert_eq!(store.segments("live").unwrap(), [segment.clone()]);
+        store.save_summary("live", "old protocol").unwrap();
+        segment.speaker_id = Some("Участник 1".into());
+        store.replace_segments("live", &[segment.clone()]).unwrap();
+        assert_eq!(store.load_summary("live").unwrap(), "old protocol");
+        assert_eq!(store.segments("live").unwrap(), [segment]);
+        let saved = store.get("live").unwrap().unwrap();
+        assert_eq!(saved.status, TranscriptionStatus::Completed);
+        assert_eq!(saved.audio_path.as_deref(), Some("system.ogg"));
+        assert_eq!(saved.duration_seconds, Some(10.0));
     }
 
     #[test]

@@ -4,7 +4,7 @@ This document is an attribution and audit aid, not legal advice. The root [MIT l
 
 ## Downloaded model artifacts
 
-These files are downloaded on user request and are not committed to this repository or bundled in release packages. Exact revisions and hashes are in [MODEL.md](MODEL.md).
+The standard packages download models on request. The offline Apple Silicon edition ships verified copies with the application. See [the offline package notes](MACOS_OFFLINE.md) and [MODEL.md](MODEL.md) for model provenance.
 
 | Component | How it is used | Upstream / declared license |
 | --- | --- | --- |
@@ -37,7 +37,7 @@ Operating-system APIs and redistributables (WebView2, Windows audio APIs, Apple 
 
 ## Distribution review notes
 
-- The current application packages are distributed without downloaded model files. Users fetch them separately through explicit UI action.
+- The offline macOS edition includes the model files listed in its package notes.
 - Symphonia's MPL-2.0 and `shine-rs`'s LGPL-2.0 deserve explicit release-compliance review. The repository's own MIT label must not be used as a blanket statement for the complete executable.
 - Before each public binary release, generate or refresh a machine-readable dependency/license report from the lockfiles and preserve all notices required by resolved dependency versions.
 - Any future decision to bundle model files requires a fresh review of the exact artifact revision and its accompanying license files/model card.

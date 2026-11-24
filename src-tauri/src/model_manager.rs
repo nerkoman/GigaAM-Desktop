@@ -54,17 +54,25 @@ pub struct ModelStatus {
 
 pub struct ModelManager {
     directory: PathBuf,
+    from_bundle: bool,
     status: Arc<Mutex<ModelStatus>>,
     cancel: Arc<AtomicBool>,
 }
 
 impl ModelManager {
     pub fn new(directory: PathBuf) -> Self {
-        let installed = generation_valid(&directory);
+        Self::with_bundle(directory, None)
+    }
+
+    pub fn with_bundle(directory: PathBuf, bundled: Option<PathBuf>) -> Self {
+        let user_installed = generation_valid(&directory);
+        let bundled = bundled.filter(|path| !user_installed && generation_valid(path));
+        let from_bundle = bundled.is_some();
         Self {
-            directory,
+            directory: bundled.unwrap_or(directory),
+            from_bundle,
             status: Arc::new(Mutex::new(ModelStatus {
-                installed,
+                installed: user_installed || from_bundle,
                 downloading: false,
                 downloaded_bytes: 0,
                 total_bytes: ARTIFACTS.iter().map(|artifact| artifact.bytes).sum(),
@@ -83,6 +91,12 @@ impl ModelManager {
     }
 
     pub fn start(&self, completion: Option<Sender<bool>>) -> Result<()> {
+        if self.from_bundle {
+            if let Some(completion) = completion {
+                let _ = completion.send(true);
+            }
+            return Ok(());
+        }
         let mut status = self.status.lock().unwrap();
         if status.downloading {
             bail!("model download already active");

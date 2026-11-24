@@ -51,6 +51,73 @@ impl ArchiveFormat {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+pub(crate) struct TrackOffset {
+    pub file: String,
+    #[serde(default)]
+    pub offset_seconds: f64,
+}
+
+/// Rebuild a stopped session's archive from the retained mono 48 kHz f32 tracks.
+/// Each encoder publishes by rename. A retry can reuse tracks committed before a crash.
+pub(crate) fn recover_retained_tracks(directory: &Path, started_ms: i64) -> Result<Option<(PathBuf, f64)>> {
+    let channels = ["microphone", "system"];
+    if !channels.iter().any(|kind| directory.join(format!("{kind}.f32")).is_file()) {
+        return Ok(None);
+    }
+    static RECOVERY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = RECOVERY.lock().map_err(|_| anyhow::anyhow!("Восстановление дорожек прервано"))?;
+    let manifest = directory.join("tracks.json");
+    let tracks: Vec<TrackOffset> = if manifest.is_file() {
+        serde_json::from_slice(&fs::read(&manifest)?)?
+    } else {
+        let entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut tracks = Vec::new();
+        for kind in channels {
+            let mut archived = entries.iter().map(|entry| entry.path()).filter(|path| {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                (stem == kind || stem.strip_prefix(kind).is_some_and(|s| s.starts_with('-')))
+                    && matches!(path.extension().and_then(|s| s.to_str()), Some("ogg" | "wav" | "flac" | "mp3"))
+            });
+            let raw = directory.join(format!("{kind}.f32"));
+            let path = if let Some(existing) = archived.next() {
+                anyhow::ensure!(archived.next().is_none(), "Найдено несколько архивов дорожки {kind}");
+                existing
+            } else if raw.is_file() {
+                let size = fs::metadata(&raw)?.len();
+                anyhow::ensure!(size > 0 && size % 4 == 0, "Повреждена исходная дорожка {kind}");
+                let path = directory.join(format!("{kind}-{}.ogg", archive_timestamp(started_ms)));
+                encode_raw_48k(&raw, &path, ArchiveFormat::Ogg)?;
+                path
+            } else {
+                continue;
+            };
+            // The old raw format did not persist the capture clock offsets.
+            tracks.push(TrackOffset { file: path.file_name().unwrap().to_string_lossy().into_owned(), offset_seconds: 0.0 });
+        }
+        let staged = directory.join("tracks.recovery.partial");
+        let mut file = fs::File::create(&staged)?;
+        file.write_all(&serde_json::to_vec_pretty(&tracks)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(staged, &manifest)?;
+        tracks
+    };
+    let first = tracks.first().context("В архиве нет дорожек")?;
+    let mut duration: f64 = 0.0;
+    for track in &tracks {
+        let file = Path::new(&track.file);
+        anyhow::ensure!(file.file_name() == Some(file.as_os_str()) && directory.join(file).is_file(), "Дорожка из tracks.json недоступна");
+        let kind = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").split('-').next().unwrap_or("");
+        if channels.contains(&kind) {
+            if let Ok(meta) = fs::metadata(directory.join(format!("{kind}.f32"))) {
+                duration = duration.max(track.offset_seconds + meta.len() as f64 / (48_000.0 * 4.0));
+            }
+        }
+    }
+    Ok(Some((directory.join(&first.file), duration)))
+}
+
 fn archive_timestamp(now_ms: i64) -> String {
     let seconds = now_ms.div_euclid(1000);
     let days = seconds.div_euclid(86_400);
@@ -1392,6 +1459,30 @@ pub mod platform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovers_cancelled_raw_tracks_and_preserves_offsets_on_retry() {
+        let dir = std::env::temp_dir().join(format!("gigaam-raw-recovery-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        for name in ["microphone.f32", "system.f32"] {
+            fs::write(dir.join(name), vec![0u8; 48_000 * 4]).unwrap();
+        }
+        let (audio, duration) = recover_retained_tracks(&dir, 0).unwrap().unwrap();
+        assert!(audio.is_file());
+        assert_eq!(duration, 1.0);
+        let manifest = dir.join("tracks.json");
+        let mut tracks: Vec<TrackOffset> = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(tracks.len(), 2);
+        for track in &tracks {
+            assert!(fs::read(dir.join(&track.file)).unwrap().starts_with(b"OggS"));
+        }
+        tracks[1].offset_seconds = 0.25;
+        let existing = serde_json::to_vec(&tracks).unwrap();
+        fs::write(&manifest, &existing).unwrap();
+        assert_eq!(recover_retained_tracks(&dir, 0).unwrap().unwrap(), (audio, 1.25));
+        assert_eq!(fs::read(manifest).unwrap(), existing);
+        assert_eq!(fs::metadata(dir.join("microphone.f32")).unwrap().len(), 48_000 * 4);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     #[ignore = "explicit speech codec benchmark; run with --ignored --nocapture"]
     fn compare_speech_archive_profiles() {

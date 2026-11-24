@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { listen } from '@tauri-apps/api/event';
 import Page from './+page.svelte';
 import * as browserStorage from '../lib/browser-storage';
 
@@ -29,7 +30,7 @@ type Item = {
 	source_filename: string;
 	source_path: string;
 	created_ms: number;
-	status: 'completed';
+	status: 'completed' | 'cancelled' | 'transcribing';
 	completed_chunks: number;
 };
 
@@ -122,6 +123,41 @@ describe('GigaAM page', () => {
 		await waitFor(() => expect(invoke).toHaveBeenCalledWith('diarize_recording', { id: historyItem.id, modelPath: 'model.onnx', speakerCount: 4 }));
 		expect(invoke).not.toHaveBeenCalledWith('retry_transcription', expect.anything());
 	});
+	it('runs local diarization on a stopped, cancelled session and shows its protocol', async () => {
+		mockBackend({ items: [{ ...historyItem, kind: 'live', status: 'cancelled', source_path: '' }] });
+		const backend = invoke.getMockImplementation()!;
+		let finishProtocol!: (value: null) => void;
+		invoke.mockImplementation(async (command: string, ...args: unknown[]) => {
+			if (command === 'process_local_meeting') return new Promise<null>((resolve) => { finishProtocol = resolve; });
+			if (command === 'load_summary') return 'Готовый протокол';
+			return backend(command, ...args);
+		});
+		render(Page);
+		await fireEvent.click(await screen.findByText('meeting.wav'));
+		await screen.findByText('Проверочный текст');
+		await fireEvent.click(screen.getByText('Диаризация + протокол', { selector: 'button' }));
+		await waitFor(() => expect(invoke).toHaveBeenCalledWith('process_local_meeting', { id: historyItem.id, speakerCount: null, ollamaModel: 'qwen3.5:4b' }));
+		const progress = vi.mocked(listen).mock.calls.find(([event]) => event === 'local-meeting-protocol')![1];
+		progress({ event: 'local-meeting-protocol', id: 1, payload: historyItem.id });
+		expect(await screen.findByText('Говорящие определены. Составляется протокол…')).toBeTruthy();
+		finishProtocol(null);
+		expect(await screen.findByText('Готовый протокол')).toBeTruthy();
+	});
+	it('keeps the diarized transcript visible if the protocol service fails', async () => {
+		mockBackend({ items: [historyItem] });
+		const backend = invoke.getMockImplementation()!;
+		invoke.mockImplementation(async (command: string, ...args: unknown[]) => {
+			if (command === 'process_local_meeting') return 'Диаризация готова. Ollama недоступна.';
+			if (command === 'load_summary') return 'Предыдущий протокол';
+			return backend(command, ...args);
+		});
+		render(Page);
+		await fireEvent.click(await screen.findByText('meeting.wav'));
+		await fireEvent.click(screen.getByText('Диаризация + протокол', { selector: 'button' }));
+		expect(await screen.findByText('Диаризация готова. Ollama недоступна.')).toBeTruthy();
+		expect(screen.getByRole('button', { name: 'Проверочный текст' })).toBeTruthy();
+		expect(screen.queryByText('Предыдущий протокол')).toBeNull();
+	});
 	it('keeps microphone and system labels alongside speaker labels', async () => {
 		mockBackend({ items: [historyItem] });
 		const backend = invoke.getMockImplementation()!;
@@ -133,6 +169,8 @@ describe('GigaAM page', () => {
 		await fireEvent.click(await screen.findByText('meeting.wav'));
 		expect(await screen.findByText('Speaker 1')).toBeTruthy();
 		expect(screen.getByText('Speaker 2')).toBeTruthy();
+		await fireEvent.click(screen.getByText('Копировать', { selector: 'button' }));
+		expect(navigator.clipboard.writeText).toHaveBeenCalledWith(expect.stringContaining('Speaker 2 (Система): Здравствуйте.'));
 	});
 	it('shows speaker labels on imported files', async () => {
 		mockBackend({ items: [historyItem] });
@@ -729,5 +767,26 @@ describe('GigaAM page', () => {
 		await fireEvent.click(screen.getByRole('button', { name: '🇬🇧 English' }));
 		expect(screen.getByLabelText('Language').textContent).toContain('🇬🇧');
 		resolveStop();
+	});
+	it('finishes the live archive when Stop is clicked below the transcript', async () => {
+		const liveItem: Item = { ...historyItem, kind: 'live', status: 'transcribing', source_path: '' };
+		mockBackend();
+		const backend = invoke.getMockImplementation()!;
+		let active = false;
+		invoke.mockImplementation(async (command: string, ...args: unknown[]) => {
+			if (command === 'start_live') { active = true; return { started_ms: Date.now() }; }
+			if (command === 'list_history') return active ? [liveItem] : [];
+			if (command === 'live_status' && active) return { microphone_level: 0, system_level: 0, model_ready: true, paused: false };
+			return backend(command, ...args);
+		});
+		render(Page);
+		await waitFor(() => expect(screen.queryByText('Требуется модель распознавания')).not.toBeInTheDocument());
+		await fireEvent.click(await screen.findByRole('button', { name: 'Записать' }));
+		await fireEvent.click(screen.getByRole('button', { name: '●Запись' }));
+		const footerStop = await screen.findByRole('button', { name: 'Стоп' });
+		await waitFor(() => expect(footerStop).toBeEnabled());
+		await fireEvent.click(footerStop);
+		await waitFor(() => expect(invoke).toHaveBeenCalledWith('stop_live'));
+		expect(invoke).not.toHaveBeenCalledWith('cancel_transcription', expect.anything());
 	});
 });

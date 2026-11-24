@@ -61,15 +61,16 @@ pub fn export(
 }
 
 fn labeled_text(segment: &TranscriptSegment, multi_source: bool) -> String {
-    if !multi_source {
-        return segment.text.clone();
-    }
-    let author = match segment.source_track {
-        SourceTrack::Microphone => "Микрофон",
-        SourceTrack::System => "Система",
-        SourceTrack::File => return segment.text.clone(),
+    let track = match (multi_source, segment.source_track) {
+        (true, SourceTrack::Microphone) => Some("Микрофон"),
+        (true, SourceTrack::System) => Some("Система"),
+        _ => None,
     };
-    format!("{author}: {}", segment.text)
+    match (segment.speaker_id.as_deref().filter(|name| !name.is_empty()), track) {
+        (Some(speaker), Some(track)) => format!("{speaker} ({track}): {}", segment.text),
+        (Some(author), None) | (None, Some(author)) => format!("{author}: {}", segment.text),
+        (None, None) => segment.text.clone(),
+    }
 }
 
 fn timestamp(seconds: f64, separator: char) -> String {
@@ -157,5 +158,10 @@ mod tests {
                 .unwrap()
                 .contains("Микрофон: Привет")
         );
+        segments[1].speaker_id = Some("Участник 2".into());
+        for format in [ExportFormat::Txt, ExportFormat::Srt, ExportFormat::Vtt] {
+            assert!(export(&segments, format).unwrap().contains("Участник 2 (Система): Ответ"));
+            assert!(export(&segments[1..], format).unwrap().contains("Участник 2: Ответ"));
+        }
     }
 }
